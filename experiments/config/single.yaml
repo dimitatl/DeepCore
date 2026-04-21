@@ -1,0 +1,33 @@
+# Minimal single-experiment config. Fast sanity check: ~a few minutes on a GPU.
+model: ResNet18
+selection: Uniform
+fraction: 0.1
+seed: 0
+
+# Training
+epochs: 30
+selection_epochs: 5
+batch: 128
+lr: 0.1
+workers: 2
+test_interval: 5
+balance: true
+
+# Dataset
+data_path: data
+class_ids: [3, 5]   # binary CIFAR10: cat vs dog
+
+# Imbalance (1.0 = balanced)
+imbalance:
+  ratio: 1.0
+  majority_class: 0
+
+# Label noise
+label_noise:
+  ratio: 0.2
+  type: uniform     # or "class_dependent" / "pair_flip"
+
+# Feature noise (Gaussian, applied post-normalization)
+feature_noise:
+  ratio: 0.0
+  sigma: 0.1
