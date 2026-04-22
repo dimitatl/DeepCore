@@ -165,8 +165,15 @@ def ResNet(arch: str, channel: int, num_classes: int, im_size, record_embedding:
                                  record_embedding=record_embedding, no_grad=no_grad)
         else:
             raise ValueError("Model architecture not found.")
-        from torch.hub import load_state_dict_from_url
-        state_dict = load_state_dict_from_url(resnet.model_urls[arch], progress=True)
+        from torchvision.models import ResNet18_Weights, ResNet34_Weights, ResNet50_Weights, ResNet101_Weights, ResNet152_Weights
+        _weights_map = {
+            "resnet18": ResNet18_Weights.IMAGENET1K_V1,
+            "resnet34": ResNet34_Weights.IMAGENET1K_V1,
+            "resnet50": ResNet50_Weights.IMAGENET1K_V1,
+            "resnet101": ResNet101_Weights.IMAGENET1K_V1,
+            "resnet152": ResNet152_Weights.IMAGENET1K_V1,
+        }
+        state_dict = _weights_map[arch].get_state_dict(progress=True)
         net.load_state_dict(state_dict)
 
         if channel != 3:
