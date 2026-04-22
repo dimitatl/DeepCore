@@ -6,12 +6,16 @@ A single experiment = (dataset config) x (noise config) x (imbalance config)
 Produces a directory with:
     manifest.json   -- config + all scalar metrics
     arrays.npz      -- per-sample arrays (predictions, probs, entropies, is_noisy, selected)
+
+Grid execution order: for each (dataset config, seed), the dataset is built ONCE and all
+(selection, fraction) combinations are evaluated before moving to the next dataset config.
 """
 import copy
 import itertools
 import os
 import random
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +32,14 @@ from .training import build_network, train_model, _augment_cifar
 from .evaluation import evaluate_test, evaluate_train_separation
 from .logging_utils import save_run
 from utils import WeightedSubset
+
+# Axes that define the dataset — everything else is a method/model axis.
+_DATASET_AXES = frozenset({
+    "imbalance.ratio", "imbalance.majority_class",
+    "label_noise.ratio", "label_noise.type", "label_noise.flip_matrix",
+    "feature_noise.ratio", "feature_noise.sigma",
+    "class_ids", "data_path",
+})
 
 
 def _set_seed(seed):
@@ -89,21 +101,37 @@ def _build_dataset(config, seed):
         "dst_train": noisy_train,
         "dst_test": dst_test,
         "full_class_dist": full_class_dist,
+        # Store original transform so run_experiment can reset before re-augmenting.
+        "base_transform": noisy_train.transform,
     }
 
 
-def run_experiment(config: Dict[str, Any], output_dir: str, verbose: bool = True):
-    """Run one experimental condition for one seed and write out results."""
+def run_experiment(config: Dict[str, Any], output_dir: str, verbose: bool = True,
+                   prebuilt_data: Optional[Dict] = None):
+    """Run one experimental condition for one seed and write out results.
+
+    If `prebuilt_data` is provided the dataset build step is skipped.  The
+    caller must ensure the config's dataset axes match what was used to build
+    it.  The dataset's transform is reset to its original state before
+    augmentation is applied so that multiple experiments can safely share one
+    dataset object.
+    """
     t0 = time.time()
     seed = int(config["seed"])
     _set_seed(seed)
 
-    data = _build_dataset(config, seed)
+    pin_memory = torch.cuda.is_available()
+
+    data = prebuilt_data if prebuilt_data is not None else _build_dataset(config, seed)
     dst_train = data["dst_train"]
     dst_test = data["dst_test"]
     num_classes = data["num_classes"]
     channel = data["channel"]
     im_size = data["im_size"]
+
+    # Reset to base transform before augmenting — required when dataset is reused.
+    if prebuilt_data is not None:
+        dst_train.transform = data["base_transform"]
 
     args = build_args({
         "dataset": "CIFAR10_BINARY",
@@ -129,7 +157,6 @@ def run_experiment(config: Dict[str, Any], output_dir: str, verbose: bool = True
 
     # --- Selection -----------------------------------------------------------
     sel_kwargs = config.get("selection_kwargs", {})
-    # Uncertainty / Submodular variants use `selection_method`/`function` kwargs
     if config["selection"] == "Uncertainty" and "selection_method" in config:
         sel_kwargs["selection_method"] = config["selection_method"]
     if config["selection"] == "Submodular" and "submodular_function" in config:
@@ -161,12 +188,15 @@ def run_experiment(config: Dict[str, Any], output_dir: str, verbose: bool = True
     else:
         dst_subset = torch.utils.data.Subset(dst_train, indices)
 
+    workers = args.workers
     train_loader = torch.utils.data.DataLoader(
         dst_subset, batch_size=args.train_batch, shuffle=True,
-        num_workers=args.workers, pin_memory=True, drop_last=False)
+        num_workers=workers, pin_memory=pin_memory, drop_last=False,
+        persistent_workers=(workers > 0))
     test_loader = torch.utils.data.DataLoader(
         dst_test, batch_size=args.train_batch, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+        num_workers=workers, pin_memory=pin_memory,
+        persistent_workers=(workers > 0))
 
     # --- Train ---------------------------------------------------------------
     network = build_network(args.model, channel, num_classes, im_size, args.device)
@@ -179,15 +209,15 @@ def run_experiment(config: Dict[str, Any], output_dir: str, verbose: bool = True
     test_eval = evaluate_test(network, test_loader, num_classes, args.device)
 
     # --- Separation: score entire training set (deterministic loader) --------
-    # Temporarily remove augmentation for deterministic forward pass.
     eval_transform = _strip_augmentation(dst_train)
     try:
         full_train_loader = torch.utils.data.DataLoader(
             dst_train, batch_size=args.train_batch, shuffle=False,
-            num_workers=args.workers, pin_memory=True)
+            num_workers=workers, pin_memory=pin_memory,
+            persistent_workers=(workers > 0))
         sep_eval = evaluate_train_separation(network, full_train_loader, dst_train, args.device)
     finally:
-        dst_train.transform = eval_transform  # restore
+        dst_train.transform = eval_transform  # restore augmented transform
 
     # --- Assemble manifest ---------------------------------------------------
     manifest = {
@@ -232,53 +262,34 @@ def run_experiment(config: Dict[str, Any], output_dir: str, verbose: bool = True
 
 
 def _strip_augmentation(dst_train):
-    """If augmentation transform was composed on top of base transform, strip it for eval.
-
-    Returns the current transform so caller can restore it.
-    """
+    """Strip augmentation transforms for deterministic eval; return current transform for restore."""
     from torchvision import transforms
     t = dst_train.transform
     if isinstance(t, transforms.Compose):
-        # The base normalization transform is the last element for our pipeline.
         base = t.transforms[-1]
         dst_train.transform = base
     return t
 
 
-def run_grid(grid_config: Dict[str, Any], output_root: str, verbose: bool = True):
-    """Expand a grid config into individual experiments.
+# Axes that become irrelevant when a "parent" axis takes a particular value.
+REDUNDANT_AXES = [
+    {"trigger_key": "label_noise.ratio", "trigger_value": 0.0,
+     "collapse": {"label_noise.type": "uniform",
+                  "label_noise.flip_matrix": None}},
+    {"trigger_key": "feature_noise.ratio", "trigger_value": 0.0,
+     "collapse": {"feature_noise.sigma": 0.0}},
+    {"trigger_key": "imbalance.ratio", "trigger_value": 1.0,
+     "collapse": {"imbalance.majority_class": 0}},
+]
 
-    grid_config keys:
-        base: dict of shared config
-        grid: dict of {param: [values]} -- cartesian product
-        seeds: list of seeds
-    """
-    base = grid_config.get("base", {})
-    grid = grid_config.get("grid", {})
-    seeds = grid_config.get("seeds", [0])
 
-    keys = list(grid.keys())
-    value_lists = [grid[k] for k in keys]
-    combos = list(itertools.product(*value_lists)) if keys else [()]
-
-    results = []
-    os.makedirs(output_root, exist_ok=True)
-    for combo in combos:
-        combo_cfg = dict(base)
-        for k, v in zip(keys, combo):
-            _set_nested(combo_cfg, k, v)
-        combo_name = _combo_name(keys, combo) or "default"
-        for seed in seeds:
-            cfg = copy.deepcopy(combo_cfg)
-            cfg["seed"] = int(seed)
-            run_dir = os.path.join(output_root, combo_name, f"seed{seed}")
-            if os.path.exists(os.path.join(run_dir, "manifest.json")) and not grid_config.get("overwrite", False):
-                if verbose:
-                    print(f"[runner] skipping existing: {run_dir}")
-                continue
-            manifest = run_experiment(cfg, run_dir, verbose=verbose)
-            results.append((run_dir, manifest))
-    return results
+def _get_nested(cfg, dotted_key, default=None):
+    cur = cfg
+    for p in dotted_key.split("."):
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur
 
 
 def _set_nested(cfg, dotted_key, value):
@@ -289,9 +300,132 @@ def _set_nested(cfg, dotted_key, value):
     cur[parts[-1]] = value
 
 
+def _canonicalize(combo_cfg, active_keys):
+    """Collapse redundant axes in-place; return the set of axes that remain meaningful."""
+    effective = set(active_keys)
+    for rule in REDUNDANT_AXES:
+        tk = rule["trigger_key"]
+        if _get_nested(combo_cfg, tk) == rule["trigger_value"]:
+            for dep_key, canon_val in rule["collapse"].items():
+                if dep_key in effective:
+                    _set_nested(combo_cfg, dep_key, canon_val)
+                    effective.discard(dep_key)
+    return effective
+
+
 def _combo_name(keys, values):
     parts = []
     for k, v in zip(keys, values):
         short = k.split(".")[-1]
         parts.append(f"{short}={v}")
     return "__".join(parts)
+
+
+def _dataset_key(cfg):
+    """Return a hashable key representing the dataset-defining portion of a config."""
+    return (
+        tuple(cfg.get("class_ids", [3, 5])),
+        cfg.get("data_path", "data"),
+        _get_nested(cfg, "imbalance.ratio", 1.0),
+        _get_nested(cfg, "imbalance.majority_class", 0),
+        _get_nested(cfg, "label_noise.ratio", 0.0),
+        _get_nested(cfg, "label_noise.type", "uniform"),
+        _get_nested(cfg, "label_noise.flip_matrix", None),
+        _get_nested(cfg, "feature_noise.ratio", 0.0),
+        _get_nested(cfg, "feature_noise.sigma", 0.1),
+    )
+
+
+def run_grid(grid_config: Dict[str, Any], output_root: str, verbose: bool = True):
+    """Expand a grid config and run all experiments.
+
+    Iteration order: for each unique (dataset config, seed) pair, the dataset
+    is built once and all (selection, fraction) combinations are evaluated
+    before moving on.  This avoids redundant dataset rebuilds and keeps the
+    GPU pipeline warm across method comparisons on the same data.
+    """
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
+    base = grid_config.get("base", {})
+    grid = grid_config.get("grid", {})
+    seeds = grid_config.get("seeds", [0])
+
+    keys = list(grid.keys())
+    value_lists = [grid[k] for k in keys]
+    combos = list(itertools.product(*value_lists)) if keys else [()]
+
+    seen_combo_names = set()
+    unique_combos = []
+    skipped = 0
+    for combo in combos:
+        combo_cfg = copy.deepcopy(base)
+        for k, v in zip(keys, combo):
+            _set_nested(combo_cfg, k, v)
+        effective_keys = _canonicalize(combo_cfg, keys)
+        name_keys = [k for k in keys if k in effective_keys]
+        name_values = [_get_nested(combo_cfg, k) for k in name_keys]
+        combo_name = _combo_name(name_keys, name_values) or "default"
+        if combo_name in seen_combo_names:
+            skipped += 1
+            continue
+        seen_combo_names.add(combo_name)
+        unique_combos.append((combo_cfg, combo_name))
+
+    if verbose:
+        print(f"[runner] grid: {len(combos)} raw combos -> {len(unique_combos)} unique "
+              f"({skipped} collapsed as redundant); {len(seeds)} seeds each")
+
+    # Group combos by their dataset-defining config so we build the dataset once
+    # per (dataset config, seed) and run all methods before moving on.
+    dataset_groups: Dict[tuple, List] = defaultdict(list)
+    for combo_cfg, combo_name in unique_combos:
+        dk = _dataset_key(combo_cfg)
+        dataset_groups[dk].append((combo_cfg, combo_name))
+
+    if verbose:
+        print(f"[runner] {len(dataset_groups)} unique dataset configs "
+              f"x {len(seeds)} seeds = {len(dataset_groups) * len(seeds)} dataset builds")
+
+    results = []
+    os.makedirs(output_root, exist_ok=True)
+
+    for dk, combos_in_group in dataset_groups.items():
+        for seed in seeds:
+            # Check if every run in this (dataset, seed) group is already done.
+            pending = []
+            for combo_cfg, combo_name in combos_in_group:
+                run_dir = os.path.join(output_root, combo_name, f"seed{seed}")
+                if os.path.exists(os.path.join(run_dir, "manifest.json")) and \
+                        not grid_config.get("overwrite", False):
+                    if verbose:
+                        print(f"[runner] skipping existing: {run_dir}")
+                else:
+                    pending.append((combo_cfg, combo_name, run_dir))
+
+            if not pending:
+                continue
+
+            # Build dataset once for all methods in this group.
+            ref_cfg = copy.deepcopy(combos_in_group[0][0])
+            ref_cfg["seed"] = int(seed)
+            if verbose:
+                dk_str = f"imb={_get_nested(ref_cfg, 'imbalance.ratio', 1.0)}, " \
+                         f"noise={_get_nested(ref_cfg, 'label_noise.ratio', 0.0)}" \
+                         f"({_get_nested(ref_cfg, 'label_noise.type', 'uniform')}), " \
+                         f"seed={seed}"
+                print(f"[runner] building dataset: {dk_str} "
+                      f"({len(pending)} method/fraction combos)")
+            prebuilt_data = _build_dataset(ref_cfg, int(seed))
+
+            for combo_cfg, combo_name, run_dir in pending:
+                cfg = copy.deepcopy(combo_cfg)
+                cfg["seed"] = int(seed)
+                manifest = run_experiment(cfg, run_dir, verbose=verbose,
+                                          prebuilt_data=prebuilt_data)
+                results.append((run_dir, manifest))
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return results

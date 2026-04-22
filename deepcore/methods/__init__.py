@@ -1,4 +1,6 @@
 from .cal import *
+from .ccs import *
+from .classwiseccs import *
 from .contextualdiversity import *
 from .coresetmethod import *
 from .craig import *
